@@ -1,0 +1,422 @@
+---
+title: "QC_workflow_WGS"
+output: html_document
+date: "2023-12-15"
+---
+
+# Setup
+
+```{r setup}
+
+library(hg.r.utils)
+theme_hg <- get_hg_theme()
+
+```
+
+# Variant Processing and Filtering
+
+To perform variant processing and quality control, I will be using the pipeline documented here: <https://github.com/mrcepid-rap#vcf-filtering-and-rare-variant-burden-testing>. Please see this GitHub repository for more details as to how this pipeline works. Here I am just documenting commands used to run this pipeline for the purposes of reproducibility. All work for this project is being completed on the UK Biobank Research Access Platform (RAP) project MRC - Variant Filtering 450k (project-G6BJF50JJv8p4PjGB9yy7YQ2). Analysis will procede in 6 steps (after '-' is the applet being used on the RAP):
+
+1.  Splitting BCFs - [mrcepid-bcfsplitter](http://github.com/mrcepid-rap/mrcepid-bcfsplitter)
+2.  Filtering and VEP annotation - [mrcepid-filterbcf](https://github.com/mrcepid-rap/mrcepid-filterbcf)
+3.  Make combined .bgen format files and annotations for each chromosome - [mrcepid-makebgen](https://github.com/mrcepid-rap/mrcepid-makebgen)
+4.  Collapse variants into resource bundles for association testing - [mrcepid-collapsevariants](https://github.com/mrcepid-rap/mrcepid-collapsevariants)
+5.  Association testing - [mrcepid-runassociationtesting](https://github.com/mrcepid-rap/mrcepid-runassociationtesting)
+
+There is also one supplementary step that prepares genetic resource files and sample lists for association testing:
+
+-   Building of GRMs and sample inclusion/exclusion lists - [mrcepid-buildgrms](https://github.com/mrcepid-rap/mrcepid-buildgrms)
+
+## 1. Splitting BCFs
+
+The RAP stores data in 977 separate vcf.gz files in the folder `/Bulk/Exome sequences/Population level exome OQFE variants, pVCF format - interim 450k release/`. All files come pre-indexed with a .tbi index file.
+
+Due to the size of these files, the first analysis step requires splitting these files into separate chunks. In brief, each vcf file is split into chunks equal to:
+
+$$ y = sgn(x)[|\frac{n.var_{vcf}}{5000}| + 0.5] $$
+
+Thus, a split bcf file can have no fewer than 2500 sites and no more than 7500 sites. In practice, this results in most original vcf.gz files being split into between 4-5 smaller .bcfs. Note that this is the *ONLY* part of the pipeline that I have not parallelized. This was because I did this analysis prior to deciding to parallelize all other parts of the codebase.
+
+**BIG Note** There is a small bug in this pipeline that will duplicate a site if the following are true:
+
+1.  The site has an identical position value to another site in the vcf (i.e. split multiallelics)
+2.  The site and it's position duplicate SPAN the junction of a bcf split
+    -   e.g. if variant 1 of a multiallelic pair is variant no. 5000 and variant 2 is variant no. 5001
+
+This bug will result in both variants in the pair being present in both split bcf files. In theory, this could also happen to a 3 variant multiallelic, but I have not encountered such a situation. I account for this error later in the pipeline when I extract variants according to filtering criteria (mrcepid-collapsevariants). This case is also rare. Across the 47 vcf.gz files that cover chromosome 7, this situation happened once.
+
+```{bash, eval = F}
+
+# 1. get a list of the initial VCFs (the weird perl one-liner just allows me to sort the files in coordinate order for easier tracking)
+dx ls -l 'Bulk/DRAGEN WGS/DRAGEN population level WGS variants, pVCF format [500k release]/chr7/*.vcf.gz' | perl -ne 'chomp $_; @F = split(" ", $_); if ($F[5] =~ /ukb24310_c7_b(\d+)_v1.vcf.gz/) {$pos = $1; if ($F[6] =~ /^\((\S+)\)$/) {$id=$1; print "$F[5]\t$pos\t$id\n";}}' | sort -k2,2n | awk '{print $3}' > bcf_list.chr7.txt
+
+# 2. Split to a manageable per-size job:
+split -a 3 -l 30 -d bcf_list.chr7.txt splitjob_
+
+# 3. Upload to DNAnexus
+dx upload --brief -r --destination file_lists/chr7/ splitjob_*
+
+# 4. Launch jobs:
+dx ls -l batch_lists/ | perl -ane 'chomp $_; if ($F[6] =~ /^\((\S+)\)$/) {print "dx run mrcepid-bcfsplitter --priority low --yes --brief --destination split_vcfs/ -iinput_vcfs=$1 -ichunk_size=2500\n";}' | less
+```
+
+## 2. Filtering and VEP Annotation
+
+### Running list of concerns / to-dos
+
+* It appears that ‘missing data’ is set to “.” rather than “./.” for the GT field
+  * I have yet to see any true missing genotypes
+* I am worried about the GQ scores per-genotype, they seem to be low for heterozygotes
+  * TODO: Look at the GQ distribution as a factor of AC
+* DP field is not coded in DRAGEN calls, need ot pull from the LAD field
+  * LAD appears to be non-standard; can be either 1 in (REF only) or 2 integers (REF / ALT)
+  * TODO: Figure out how to aggregate LAD field to filter on
+* DRAGEN QUAL fields are missing from the VCFs
+  * TODO: Shouldn't affect anything, but unsure...
+
+
+#### Exploring AC / No Calls
+
+```{r fig.height=8, fig.width=8}
+
+# DRAGEN
+ac_ns <- fread('data/AC_NS.tsv', col.names = c('ac', 'called', 'no_call','no_data'))
+ac_ns[,max_ac:=max(as.integer(str_split(ac, ",", simplify = T)), na.rm=F), by = 1:nrow(ac_ns)]
+ac_ns[,ac_bin:=cut(max_ac,breaks=10^(0:6), include.lowest=T)]
+ac_stats <- ac_ns[,sum(.N),by=ac_bin]
+
+dot_plot <- ggplot(ac_ns, aes(max_ac, no_data)) + geom_point(size=0.1) + scale_x_log10() + scale_y_log10() + theme_hg
+hist_x <- ggplot(ac_stats, aes(ac_bin, V1)) + geom_col() + theme_hg
+hist_y <- ggplot(ac_ns, aes(no_data)) + geom_histogram() + scale_x_log10() + coord_flip() + theme_hg
+
+hist_x + plot_spacer() + dot_plot + hist_y + plot_layout(ncol=2, nrow=2, heights = c(0.2,0.8), widths=c(0.8,0.2))
+
+# Graphtyper
+ac_ns <- fread('data/missing_GT.tsv', col.names = c('pos', 'ref', 'alt', 'ac', 'an', 'pop'))
+ac_ns[,no_data:=(pop-an) / 2]
+ac_ns[,ac_bin:=cut(ac,breaks=10^(0:6), include.lowest=T)]
+ac_stats <- ac_ns[,sum(.N),by=ac_bin]
+ac_stats <- ac_stats[!is.na(ac_bin)]
+
+dot_plot <- ggplot(ac_ns, aes(ac, no_data)) + geom_point(size=0.1) + scale_x_log10() + scale_y_log10() + theme_hg
+hist_x <- ggplot(ac_stats, aes(ac_bin, V1)) + geom_col() + theme_hg
+hist_y <- ggplot(ac_ns, aes(no_data)) + geom_histogram() + scale_x_log10() + coord_flip() + theme_hg
+
+hist_x + plot_spacer() + dot_plot + hist_y + plot_layout(ncol=2, nrow=2, heights = c(0.2,0.8), widths=c(0.8,0.2))
+
+```
+
+
+#### Exploring GQ
+
+```{r GQ}
+
+# MAC > 10000
+gq1 <- fread('data/QC_test.8017901.tsv', col.names=c("REF", "ALT", "SAMPLE", "GT", "GQ", "LAD", "FT", "LAF"))
+gq1[,c("RD", "AD"):=tstrsplit(LAD, ",")]
+gq1[,AD:=ifelse(is.na(AD), 0, AD)]
+gq1[,GQ:=as.integer(GQ)]
+
+gq2 <- fread('data/QC_test.10018805.tsv', col.names=c("REF", "ALT", "SAMPLE", "GT", "GQ", "LAD", "FT", "LAF"))
+gq2[,c("RD", "AD"):=tstrsplit(LAD, ",")]
+gq2[,GQ:=as.integer(GQ)]
+
+# low MAC
+gq3 <- fread('data/QC_test.8009906.tsv', col.names=c("REF", "ALT", "SAMPLE", "GT", "GQ", "LAD", "FT", "LAF"))
+gq3[,c("RD", "AD"):=tstrsplit(LAD, ",")]
+gq3[,AD:=ifelse(is.na(AD), 0, AD)]
+gq3[,GQ:=as.integer(GQ)]
+
+gq4 <- fread('data/QC_test.8016926.tsv', col.names=c("REF", "ALT", "SAMPLE", "GT", "GQ", "LAD", "FT", "LAF"))
+gq4[,c("RD", "AD"):=tstrsplit(LAD, ",")]
+gq4[,AD:=ifelse(is.na(AD), 0, AD)]
+gq4[,GQ:=as.integer(GQ)]
+
+ggplot(gq1[str_detect(GT,"2",negate = T) & str_detect(GT,"\\./\\.",negate = T)], aes(GQ, group = GT, fill=GT)) + geom_histogram(aes(y=..density..), binwidth=5, alpha=0.5, position=position_dodge()) + scale_alpha_continuous(range=c(0,1)) + ggtitle("GQ1") + get_hg_theme(add_legend = T)
+ggplot(gq2[str_detect(GT,"2",negate = T) & str_detect(GT,"\\./\\.",negate = T)], aes(GQ, group = GT, fill=GT)) + geom_histogram(aes(y=..density..), binwidth=5, alpha=0.5, position="identity") + scale_alpha_continuous(range=c(0,1))+ ggtitle("GQ2") + get_hg_theme(add_legend = T)
+ggplot(gq3[str_detect(GT,"2",negate = T) & str_detect(GT,"\\./\\.",negate = T)], aes(GQ, group = GT, fill=GT)) + geom_histogram(aes(y=..density..), binwidth=5, alpha=0.5, position="identity") + scale_alpha_continuous(range=c(0,1)) + ggtitle("GQ3") + get_hg_theme(add_legend = T)
+ggplot(gq4[str_detect(GT,"2",negate = T) & str_detect(GT,"\\./\\.",negate = T)], aes(GQ, group = GT, fill=GT)) + geom_histogram(aes(y=..density..), binwidth=5, alpha=0.5, position="identity") + scale_alpha_continuous(range=c(0,1)) + ggtitle("GQ3") + get_hg_theme(add_legend = T)
+
+```
+
+#### GQ From Graph Typer
+
+```{r}
+
+gq1_gt <- fread("data/QC_test.gt.8017901.tsv", col.names=c("REF","ALT","SAMPLE","GT","GQ","AD"))
+gq2_gt <- fread("data/QC_test.gt.10018805.tsv", col.names=c("REF","ALT","SAMPLE","GT","GQ","AD"))
+gq4_gt <- fread("data/QC_test.gt.8016926.tsv", col.names=c("REF","ALT","SAMPLE","GT","GQ","AD"))
+
+ggplot(gq1_gt[str_detect(GT,"2",negate = T) & str_detect(GT,"\\./\\.",negate = T)], aes(GQ, group = GT, fill=GT)) + geom_histogram(aes(y=..density..), binwidth=5, alpha=0.5, position="identity") + scale_alpha_continuous(range=c(0,1)) + ggtitle("GQ1") + get_hg_theme(add_legend = T)
+
+ggplot(gq2_gt[str_detect(GT,"2",negate = T) & str_detect(GT,"\\./\\.",negate = T)], aes(GQ, group = GT, fill=GT)) + geom_histogram(aes(y=..density..), binwidth=5, alpha=0.5, position="identity") + scale_alpha_continuous(range=c(0,1)) + ggtitle("GQ2") + get_hg_theme(add_legend = T)
+
+ggplot(gq4_gt[str_detect(GT,"2",negate = T) & str_detect(GT,"\\./\\.",negate = T)], aes(GQ, group = GT, fill=GT)) + geom_histogram(aes(y=..density..), binwidth=5, alpha=0.5, position="identity") + scale_alpha_continuous(range=c(0,1)) + ggtitle("GQ4") + get_hg_theme(add_legend = T)
+
+gq_merge <- merge(gq1, gq1_gt[,c("SAMPLE","GT")], by="SAMPLE")
+setnames(gq_merge,c("GT.x","GT.y"), c("GT_DRAGEN","GT_GT"))
+gq_merge[,GT_DRAGEN:=ifelse(GT_DRAGEN == '.', './.', GT_DRAGEN)]
+gq_merge[str_detect(GT_DRAGEN,"2",negate = T) & str_detect(GT_GT,"2",negate = T),table(GT_DRAGEN,GT_GT)]
+
+gq_merge <- merge(gq2, gq2_gt[,c("SAMPLE","GT")], by="SAMPLE")
+setnames(gq_merge,c("GT.x","GT.y"), c("GT_DRAGEN","GT_GT"))
+gq_merge[,GT_DRAGEN:=ifelse(GT_DRAGEN == '.', './.', GT_DRAGEN)]
+gq_merge[str_detect(GT_DRAGEN,"2",negate = T) & str_detect(GT_GT,"2",negate = T),table(GT_DRAGEN,GT_GT)]
+
+gq_merge <- merge(gq4, gq4_gt[,c("SAMPLE","GT","GQ","AD")], by="SAMPLE")
+setnames(gq_merge,c("GT.x","GT.y"), c("GT_DRAGEN","GT_GT"))
+gq_merge[,GT_DRAGEN:=ifelse(GT_DRAGEN == '.', './.', GT_DRAGEN)]
+gq_merge[str_detect(GT_DRAGEN,"2",negate = T) & str_detect(GT_GT,"2",negate = T),table(GT_DRAGEN,GT_GT)]
+
+```
+
+#### File Size
+
+```{r}
+
+files <- fread("file_lists/filterbcf/vcf_list.txt")
+
+```
+
+#### Further Exploring GQ
+
+```{r fig.height=15, fig.width=26.6}
+
+dragen <- fread("data/DRAGEN_gt.tsv", col.names=c("SAMPLE","POS","REF","ALT","GQ","GT"))
+gt <- fread("data/GT_gt.tsv", col.names=c("SAMPLE","POS","REF","ALT","GQ","GT"))
+wes <- fread("data/WES_gt.tsv", col.names=c("SAMPLE","POS","REF","ALT","GQ","GT"))
+
+dragen[,GQ:=as.integer(GQ)]
+gt[,GQ:=as.integer(GQ)]
+wes[,GQ:=as.integer(GQ)]
+
+sample_union <- intersect(dragen[,unique(SAMPLE)], gt[,unique(SAMPLE)])
+sample_union <- intersect(sample_union, wes[,unique(SAMPLE)])
+
+dragen <- dragen[SAMPLE %in% sample_union]
+gt <- gt[SAMPLE %in% sample_union]
+wes <- wes[SAMPLE %in% sample_union]
+
+expected_alleles <- fread("data/gigyf1_gt_test.tsv", col.names=c("CHROM","POS","REF","ALT","AF"))
+expected_alleles[,ID:=paste(POS, REF, ALT, sep="_")]
+
+dragen[,ID:=paste(POS, REF, ALT, sep="_")]
+gt[,ID:=paste(POS, REF, ALT, sep="_")]
+wes[,ID:=paste(POS, REF, ALT, sep="_")]
+
+dragen <- dragen[ID %in% expected_alleles[,ID]]
+gt <- gt[ID %in% expected_alleles[,ID]]
+wes <- wes[ID %in% expected_alleles[,ID]]
+
+for (table in list(dragen, gt, wes)) {
+
+  table[,GT:=ifelse(GT==".", "./.", GT)] # DRAGEN no-call weirdness
+  table[,GT:=ifelse(GT=="1/0", "0/1", GT)] # How are they phased...?
+  table[,GT:=ifelse(GT=="./0", "./.", GT)] 
+  table[,GT:=ifelse(GT=="./1", "./.", GT)]
+  table[,GT:=factor(GT, levels=c("./.","0/0","0/1","1/1"))]
+  
+}
+
+plot_gq <- function(var, af) {
+  
+  cols <- c("SAMPLE","GQ","GT")
+  merged <- merge(dragen[ID == var,..cols], gt[ID == var,..cols], by="SAMPLE", suffixes = c(".dragen",".graphtyper"))
+  merged <- merge(merged, wes[ID == var,..cols], by="SAMPLE")
+  setnames(merged,c("GQ","GT"),c("GQ.wes","GT.wes"))
+  
+  dragen_plot <- ggplot(merged, aes(GQ.dragen, group = GT.dragen, fill=GT.dragen)) + 
+    geom_histogram(binwidth=5, alpha=0.5, position="identity") +
+    scale_x_continuous(name='', breaks=seq(0,100,by=10)) +
+    scale_alpha_continuous(range=c(0,1)) + 
+    scale_fill_discrete(limits=levels(merged[,GT.dragen]), guide=guide_legend(title='GT')) +
+    ggtitle("DRAGEN") + 
+    get_hg_theme(add_legend = T)
+  
+  gt_plot <- ggplot(merged, aes(GQ.graphtyper, group = GT.graphtyper, fill=GT.graphtyper)) + 
+    geom_histogram(binwidth=5, alpha=0.5, position="identity") +
+    scale_x_continuous(name='', breaks=seq(0,100,by=10)) +
+    scale_alpha_continuous(range=c(0,1)) + 
+    scale_fill_discrete(limits=levels(merged[,GT.dragen]), guide=guide_legend(title='GT')) +
+    ggtitle("GraphTyper") + 
+    get_hg_theme(add_legend = T)
+  
+  wes_plot <- ggplot(merged, aes(GQ.wes, group = GT.wes, fill=GT.wes)) + 
+    geom_histogram(binwidth=5, alpha=0.5, position="identity") +
+    scale_x_continuous(name='', breaks=seq(0,100,by=10), limits=c(0,100)) +
+    scale_alpha_continuous(range=c(0,1)) + 
+    scale_fill_discrete(limits=levels(merged[,GT.dragen]), guide=guide_legend(title='GT')) +
+    ggtitle("WES") + 
+    get_hg_theme(add_legend = T)
+  
+  gq_comp <- ggplot(merged, aes(GQ.graphtyper, GQ.dragen, colour=GT.dragen)) + 
+    geom_point(size=0.1) + 
+    get_hg_theme()
+  
+  summary_gt <- data.table(merged[,table(GT.dragen,GT.graphtyper)])
+  
+  summary_gt_plot_orig_1 <- ggplot(summary_gt, aes(GT.dragen, GT.graphtyper, label=N)) + geom_point(aes(size=N)) + geom_text(colour='red') +
+    scale_x_discrete(name='') + scale_y_discrete(name='GraphTyper') +
+    geom_vline(xintercept=seq(0.5,4.5,by=1)) + geom_hline(yintercept=seq(0.5,4.5,by=1)) + ggtitle("Unfiltered") + get_hg_theme() +
+    theme(panel.grid.major = element_blank(), axis.line = element_blank(), axis.ticks = element_blank(), axis.text.x = element_blank())
+  
+  summary_gt <- data.table(merged[,table(GT.dragen,GT.wes)])
+  
+  summary_gt_plot_orig_2 <- ggplot(summary_gt, aes(GT.dragen, GT.wes, label=N)) + geom_point(aes(size=N)) + geom_text(colour='red') +
+    scale_x_discrete(name='DRAGEN') + scale_y_discrete(name='WES') +
+    geom_vline(xintercept=seq(0.5,4.5,by=1)) + geom_hline(yintercept=seq(0.5,4.5,by=1)) + get_hg_theme() +
+    theme(panel.grid.major = element_blank(), axis.line = element_blank(), axis.ticks = element_blank())
+  
+  gt_plots <- summary_gt_plot_orig_1 + plot_spacer() + summary_gt_plot_orig_2 + plot_layout(ncol=1, nrow=3, heights = c(1,-0.4, 1))
+  
+  merged[,FILTER.wes:=GQ.wes <= 20 | is.na(GQ.wes)]
+  merged[,FILTER.graphtyper:=GQ.graphtyper <= 20 | is.na(GQ.graphtyper)]
+  merged[,FILTER.dragen:=GQ.dragen <= 20 | is.na(GQ.dragen)]
+  
+  filter_summary <- data.table(pivot_longer(merged[,c("GT.dragen", "GT.graphtyper", "GT.wes", "FILTER.dragen", "FILTER.graphtyper", "FILTER.wes")], cols=c(GT.dragen, GT.graphtyper, GT.wes, FILTER.dragen, FILTER.graphtyper, FILTER.wes), names_to = c(".value", "tool"), names_pattern="(\\S+)\\.(\\S+)"))
+  filter_summary <- filter_summary[,sum(.N), by=c("tool", "FILTER", "GT")]
+  filter_summary[,FILTER:=factor(FILTER,levels=c("TRUE","FALSE"))]
+  
+  filter_plot <- ggplot(filter_summary, aes(tool, V1, group=GT, colour=GT, fill=FILTER)) + geom_col(position=position_dodge(0.5),width = 0.4, linewidth=1.5) + scale_fill_manual(values = c("black","lightgray"), limits = c("TRUE","FALSE")) + get_hg_theme(add_legend = T) + coord_flip()
+  
+  gt_filter <- wrap_elements(gt_plots) + filter_plot
+
+  final_plot <- dragen_plot + gt_plot + wes_plot + gt_filter + plot_layout(ncol=2,nrow=2, guides='collect') + plot_annotation(title=bquote(.(var)~-~.(af)))
+  
+  return(final_plot)
+  
+}
+
+# I have no idea why data.table is failing me
+for (i in 1:nrow(expected_alleles)) {
+  print(expected_alleles[i,plot_gq(ID,AF)])
+}
+
+```
+
+#### Further Exploring Missingness
+
+```{r fig.height=8, fig.width=8}
+
+# DRAGEN
+ac_ns <- fread('data/NS_dragen.tsv', col.names = c('ac', 'called', 'no_call','no_data'))
+ac_ns[,max_ac:=max(as.integer(str_split(ac, ",", simplify = T)), na.rm=F), by = 1:nrow(ac_ns)]
+ac_ns[,ac_bin:=cut(max_ac,breaks=10^(0:6), include.lowest=T)]
+ac_stats <- ac_ns[,sum(.N),by=ac_bin]
+
+dot_plot <- ggplot(ac_ns, aes(max_ac, no_data)) + geom_point(size=0.1) + scale_x_log10() + scale_y_log10() + theme_hg
+hist_x <- ggplot(ac_stats, aes(ac_bin, V1)) + geom_col() + theme_hg
+hist_y <- ggplot(ac_ns, aes(no_data)) + geom_histogram() + scale_x_log10() + coord_flip() + theme_hg
+
+hist_x + plot_spacer() + dot_plot + hist_y + plot_layout(ncol=2, nrow=2, heights = c(0.2,0.8), widths=c(0.8,0.2)) + plot_annotation(title='DRAGEN')
+
+# Graphtyper
+ac_ns <- fread('data/NS_gt.tsv', col.names = c('ac', 'an', 'pass_ac', 'pass_an'))
+ac_ns[,no_data:=(an-pass_an) / 2]
+ac_ns[,max_ac:=max(as.integer(str_split(ac, ",", simplify = T)), na.rm=F), by = 1:nrow(ac_ns)]
+ac_ns[,ac_bin:=cut(max_ac,breaks=10^(0:6), include.lowest=T)]
+ac_stats <- ac_ns[,sum(.N),by=ac_bin]
+ac_stats <- ac_stats[!is.na(ac_bin)]
+
+dot_plot <- ggplot(ac_ns, aes(max_ac, no_data)) + geom_point(size=0.1) + scale_x_log10() + scale_y_log10() + theme_hg
+hist_x <- ggplot(ac_stats, aes(ac_bin, V1)) + geom_col() + theme_hg
+hist_y <- ggplot(ac_ns, aes(no_data)) + geom_histogram() + scale_x_log10() + coord_flip() + theme_hg
+
+hist_x + plot_spacer() + dot_plot + hist_y + plot_layout(ncol=2, nrow=2, heights = c(0.2,0.8), widths=c(0.8,0.2)) + plot_annotation(title='GraphTyper')
+
+```
+
+## 2. Filtering and VEP Annotation
+
+This step performs filtering and VEP annotation according to parameters decided by the MRC Epidemiology RAP working group. Please see the [github page](https://github.com/mrcepid-rap/mrcepid-filterbcf) for more information.
+
+### Annotation Files
+
+Annotations need a refresh for the WGS data. Documenting this here:
+
+#### gnomAD
+
+gnomAD has updated to version 4.0, adding many more individuals. We downloaded the new sites-vcfs to our DNANexus project, extracted non-Finnish European MAFs, and created a single tabix-indexed annotation file for input into filterbcf:
+
+```{bash gnomad, eval = F}
+
+# Download vcf.bgz files from gnomad amazon server
+perl -e 'for $x (1..22, "X", "Y") {print "dx run app-url_fetcher -iurl=https://gnomad-public-us-east-1.s3.amazonaws.com/release/4.0/vcf/genomes/gnomad.genomes.v4.0.sites.chr" . $x . ".vcf.bgz --destination /project_resources/gnomad_files/;\n"}' | less
+
+# Extract sites:
+perl -e 'for $x (1..22, "X", "Y") {print "dx run app-swiss-army-knife --destination /project_resources/gnomad_files/ -icmd='\''bcftools query -o chr$x.gnomad_sites.tsv -f \"\%CHROM\\t\%POS\\t\%REF\\t\%ALT\\t\%FILTER\\t\%AF_nfe\\n\" *'\'' -iin=/project_resources/gnomad_files/gnomad.genomes.v4.0.sites.chr$x.vcf.bgz;\n";'}
+
+# Convert to a single sites file (done from a remote workstation):
+mkdir gnomad/ && cd gnomad/
+dx download project_resources/gnomad_files/*.gnomad_sites.tsv
+# Note that I use a perl one-liner to keep everything in standard chromosome order
+perl -e 'for $x (1..22, "X", "Y") {print "perl -ane '\''chomp \$_; if (\$F[5] != 0 && \$F[4] eq \"PASS\") {splice(\@F, 4, 1); print join(\"\\t\", \@F) . \"\\n\";}'\'' chr$x.gnomad_sites.tsv;\n";}' | bash > gnomad.tsv
+echo 'CHROM POS     REF     ALT     GNOMAD' > header.txt # SPACES ARE TABS!
+cat header.txt gnomad.tsv > gnomad.header.tsv
+mv gnomad.header.tsv gnomad.tsv
+bgzip gnomad.tsv
+tabix -c C -b 2 -e 2 -s 1 gnomad.tsv.gz
+dx upload gnomad.tsv.gz* --destination /project_resources/gnomad_files/
+
+```
+
+#### REVEL
+
+Here we just take the default REVEL file and put it into a format useable by our applet.
+
+```{bash revel, eval = F}
+
+mkdir revel/ && cd revel/
+wget https://zenodo.org/records/7072866/files/revel-v1.3_all_chromosomes.zip
+unzip revel-v1.3_all_chromosomes.zip
+cat revel_with_transcript_ids | tr "," "\t" > tabbed_revel.tsv
+sed '1s/.*/#&/' tabbed_revel.tsv > new_tabbed_revel.tsv
+bgzip new_tabbed_revel.tsv
+echo 'CHROM     POS     REF     ALT     REVEL' > h
+zgrep -h -v ^#chr new_tabbed_revel.tsv.gz | awk '$3 != "." ' | sort -k1,1 -k3,3n - | perl -ane 'chomp $_; print "chr$F[0]\t$F[2]\t$F[3]\t$F[4]\t$F[7]\n"' | cat h - | bgzip -c > revel.tsv.gz
+tabix -c C -s 1 -b 2 -e 2 revel.tsv.gz
+dx upload --destination /project_resources/revel_files/ revel.tsv.gz*
+
+```
+
+#### EVE
+
+I am also downloading and processing the data provided by the [EVE project](https://evemodel.org/). All of the below was done on a remote workstation. EVE data only contains information for 2,951 genes. Those genes are included in the file: `data/EVE_genes.tsv` for filtering burden tests.
+
+```{bash, eval = F}
+
+# Download raw files
+# Note -- this will create a file called "something.html" you need to rename this file to be able to unzip it
+wget https://evemodel.org/api/proteins/bulk/download/
+mv --- EVE_all_data.zip
+unzip EVE_all_data.zip
+
+# EVE has one VCF file / gene located in the VCF folder after unzipping.
+# This **insane** one-liner will take the VCF, extract all single-nucleotide missense variants (EVE also does MNVs) and create a .tsv in the format filterbcf expects. It will take ~20-30m to run through all of the VCF files linearly
+# There is one additional column with ENST, as we HAVE to match on protein otherwise the annotation is worthless.
+ls *.vcf | sed 's+_HUMAN.vcf++' | perl -ne 'chomp $_; print "perl -ne '\''if (\$_ !~ /^#/) {print \"chr\$_\"} else {print \"\$_\"}'\'' $_" . "_HUMAN.vcf > $_" . "_chr.vcf; bcftools reheader -f hs38DH.fa.fai $_" . "_chr.vcf | bcftools norm -f hs38DH.fa  | bcftools sort | bcftools view -i \"STRLEN(REF)=1\" | bcftools query -f \"\%CHROM\\t\%POS\\t\%REF\\t\%ALT\\t\%EVE\\t\%EnsTranscript\\n\" > $_" . ".tsv;\n"'
+
+# Now mash everything together:
+cat *.tsv | sort -k1,1 -k2,2n - > eve.tsv
+echo '#CHROM POS REF ALT EVE ENST' > h # SPACES ARE TABS! The # at the front is ESSENTIAL for this workflow, do not forget it!
+cat h eve.tsv > eve.header.tsv
+sed -i 's_|$__' eve.header.tsv # removes trailing '|'
+mv eve.header.tsv eve.tsv
+
+
+
+```
+
+#### AlphaMissense
+
+```{bash, eval = F}
+```
+
+
+### Running filterbcf
+
+```{bash filterbcf, eval = F}
+
+dx run mrcepid-filterbcf --destination filtered_vcfs/ --priority normal --yes --brief -iinput_vcfs=file-GgxGBz8J9bvqybX2f7yz1K8j -icoordinates_name=test_coords.txt -ivep_cache=project-GFPBQv8J0zVvBX9XJyqyqYz1:file-GPfGX48JbPz57ZG2qBVV2Fy7 -iloftee_libraries=project-GFPBQv8J0zVvBX9XJyqyqYz1:file-GFYy320J0zVqyqQq6pgYFYFp -icadd_annotations=project-GFPBQv8J0zVvBX9XJyqyqYz1:file-GFQZY9QJ8Bjq9bJY9z4p72Xx -iprecomputed_cadd_snvs=project-GFPBQv8J0zVvBX9XJyqyqYz1:file-GFbgYZjJXG9Q982Y4p5q5XXZ -iprecomputed_cadd_indels=project-GFPBQv8J0zVvBX9XJyqyqYz1:file-GFbgJxjJ3bB59BK82ZQF0k3z -iadditional_annotations={project-GbZqJpQJ9bvfF97z25B9Gkjv:file-Ggv4zZ8J9bvz3Z3vxbGGVY20, project-GbZqJpQJ9bvfF97z25B9Gkjv:file-Ggv73B8J9bvY1kjVpj12PpBQ}
+
+```
